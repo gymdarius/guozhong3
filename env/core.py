@@ -26,7 +26,7 @@ class UAVEnv:
             self.delta = global_cfg.get('delta', 0.1)
             self.max_steps = global_cfg.get('max_steps', 300)
             self.blue_advantage = global_cfg.get('blue_advantage', 0.7)
-            self.escape_penalty = global_cfg.get('escape_penalty', 8.0)
+            self.escape_penalty = global_cfg.get('escape_penalty', 20.0)
             self.terminal_reward = global_cfg.get('terminal_reward', 50.0)
             self.dt = global_cfg.get('dt', 1.0)
             self.blue_max_speed = global_cfg.get('blue_max_speed', 15.0)
@@ -164,6 +164,15 @@ class UAVEnv:
                 self.red_units[i].X += v[0] * self.dt
                 self.red_units[i].Y += v[1] * self.dt
                 self.red_units[i].Z += v[2] * self.dt
+        # S3: 移动完成后再做突围判定（仅用地面投影距离）
+        if self.scenario == 'S3' and self.safe_center is not None and self.safe_radius is not None:
+            for i in np.where(self.red_alive)[0]:
+                pos_xy = np.array([self.red_units[i].X, self.red_units[i].Y], dtype=float)
+                center_xy = np.array(self.safe_center[:2], dtype=float)
+                dist_xy = np.linalg.norm(pos_xy - center_xy)
+                if dist_xy >= float(self.safe_radius):
+                    self.red_escaped[i] = True
+                    self.red_alive[i] = False
         # 同步数组表示
         self._sync_arrays_from_units()
         # combat
@@ -311,6 +320,7 @@ class UAVEnv:
                 return
             for i in np.where(self.red_alive)[0]:
                 if not self.red_escaped[i]:
+                    # 向安全区外沿径向外逃（在地面投影平面内）
                     direction = self.red_positions[i] - self.safe_center
                     direction[2] = 0.0
                     dist = np.linalg.norm(direction)
@@ -319,12 +329,7 @@ class UAVEnv:
                         dist = 1.0
                     v = (direction / dist) * self.red_max_speed
                     self.red_units[i].vel = v
-                    # pre-check escape if move one dt
-                    new_pos = self.red_positions[i] + v * self.dt
-                    new_dist = np.linalg.norm(new_pos - self.safe_center)
-                    if new_dist >= self.safe_radius:
-                        self.red_escaped[i] = True
-                        self.red_alive[i] = False
+            # 注意：不在此处预判突围，改为在 step() 位置积分后以二维距离判定
         elif self.scenario == 'S4':
             if not np.any(self.blue_alive):
                 return
