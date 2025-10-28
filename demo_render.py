@@ -7,7 +7,8 @@ from mpl_toolkits.mplot3d import art3d
 
 from env.core import UAVEnv
 from env import scenes
-from policy.mlp import MLPPolicy
+#from policy.mlp import MLPPolicy
+from policy.mlp_continuous import MLPPolicyContinuous
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize a scenario with a trained model or random policy.")
@@ -28,7 +29,8 @@ if __name__ == "__main__":
             scen_num = scen[1:] if scen.startswith('S') else scen
             model_file = os.path.join("models", f"M{scen_num}.npy")
         # Load model if exists
-        policy = MLPPolicy(input_dim=10, hidden_dims=[64, 64], output_dim=8)
+        #policy = MLPPolicy(input_dim=10, hidden_dims=[64, 64], output_dim=8)
+        policy = MLPPolicyContinuous(input_dim=10, hidden_dims=[64,64], action_dim=4)
         if os.path.exists(model_file):
             params = np.load(model_file, allow_pickle=True)
             policy.set_params(params)
