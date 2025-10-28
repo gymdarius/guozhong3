@@ -1,0 +1,11 @@
+alpha: 2.0            # 击杀差奖励系数 α
+beta: 1.5             # 目标进度奖励系数 β
+gamma: 0.5            # 存活差奖励系数 γ
+delta: 0.1            # 时间惩罚系数 δ
+max_steps: 300        # 每局最大步数 T
+population_size: 50   # ES种群大小 N
+elite_size: 10        # ES精英样本数 k
+iterations: 200       # ES训练迭代轮数
+sigma: 0.1            # 噪声标准差
+learning_rate: 0.05   # 均值更新学习率
+eval_episodes: 20     # 每个迁移评估的默认对局数 K
