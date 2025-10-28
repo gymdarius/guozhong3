@@ -9,3 +9,4 @@ iterations: 200       # ES训练迭代轮数
 sigma: 0.1            # 噪声标准差
 learning_rate: 0.05   # 均值更新学习率
 eval_episodes: 20     # 每个迁移评估的默认对局数 K
+blue_advantage: 0.7

@@ -1,3 +1,4 @@
+# 完整文件（基于你已有的 core.py，添加了 escape_penalty 与 terminal_reward 的支持）
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # For 3D rendering (if needed)
@@ -13,7 +14,7 @@ class UAVEnv:
     - State representation (observation of relative positions and various features)
     - Blue actions (movement commands) and their effects
     - Red side scripted behavior per scenario
-    - Combat interactions (kills, escapes, etc.)
+    - Combat interactions (probabilistic kills, escapes, etc.)
     - Reward calculation and episode termination.
     """
     def __init__(self, scene_cfg, global_cfg=None):
@@ -30,6 +31,12 @@ class UAVEnv:
             self.gamma = global_cfg.get('gamma', 0.5)
             self.delta = global_cfg.get('delta', 0.1)
             self.max_steps = global_cfg.get('max_steps', 300)
+            # 新增：蓝方交战优势参数（0.5 表示无偏，>0.5 表示偏向蓝方）
+            self.blue_advantage = global_cfg.get('blue_advantage', 0.7)
+            # 新增：每次红方成功逃逸时对蓝方的惩罚（正数，越大蓝方越重视阻止逃逸）
+            self.escape_penalty = global_cfg.get('escape_penalty', 8.0)
+            # 新增：终局胜利/失败的显著奖励（用于强化学习/ES的终局信号）
+            self.terminal_reward = global_cfg.get('terminal_reward', 50.0)
         else:
             # defaults
             self.alpha = 2.0
@@ -37,6 +44,9 @@ class UAVEnv:
             self.gamma = 0.5
             self.delta = 0.1
             self.max_steps = 300
+            self.blue_advantage = 0.7
+            self.escape_penalty = 8.0
+            self.terminal_reward = 50.0
         # Extract scenario-specific data
         self.initial_blue_positions = np.array(self.scene['blue_init'], dtype=float)
         self.initial_red_positions = np.array(self.scene['red_init'], dtype=float)
@@ -65,6 +75,11 @@ class UAVEnv:
         # For reward calculation
         self.prev_kill_diff = 0
         self.prev_progress = 0.0
+        # track previous escaped count for reward shaping
+        self.prev_escaped_count = 0
+        # Store initial counts
+        self.num_blue_init = len(self.initial_blue_positions)
+        self.num_red_init = len(self.initial_red_positions)
     
     def reset(self):
         """Reset the environment to the initial state. Returns the initial observation."""
@@ -81,14 +96,8 @@ class UAVEnv:
         # Determine initial altitude level for Blue (assume all blue at same level)
         # We'll derive from first Blue UAV position:
         initial_alt = self.blue_positions[0, 2]
-        # Find nearest altitude level index
-        if abs(initial_alt - self.altitude_levels[1]) < 1e-3:
-            self.blue_alt_level = 1
-        elif abs(initial_alt - self.altitude_levels[2]) < 1e-3:
-            self.blue_alt_level = 2
-        else:
-            self.blue_alt_level = 0
-        # Red altitude not explicitly needed, assume similar approach if needed
+        # Find nearest altitude level index (更稳健)
+        self.blue_alt_level = int(np.argmin([abs(initial_alt - a) for a in self.altitude_levels]))
         # Add slight random jitter to initial positions for stochasticity
         # (to avoid overfitting to one configuration)
         jitter = np.random.uniform(-5.0, 5.0, size=self.blue_positions.shape)
@@ -98,6 +107,8 @@ class UAVEnv:
         # Compute initial progress for reward tracking
         self.prev_kill_diff = 0
         self.prev_progress = self._compute_goal_progress()
+        # Reset prev escaped count
+        self.prev_escaped_count = 0
         # Return initial observation
         return self._get_observation()
     
@@ -112,13 +123,19 @@ class UAVEnv:
         self._apply_blue_action(action)
         # Apply enemy scripted behavior according to scenario
         self._apply_enemy_behavior()
-        # Check combat interactions (kills, escapes)
+        # Check combat interactions (probabilistic kills, escapes)
         self._handle_combat()
-        # Compute reward
+        # Compute reward (dense shaping)
         obs = self._get_observation()  # new observation after moves and combat
         reward = self._compute_reward(obs)
         # Check termination conditions
         done, winner = self._check_done()
+        # Terminal bonus/penalty
+        if done:
+            if winner == 'blue':
+                reward += self.terminal_reward
+            elif winner == 'red':
+                reward -= self.terminal_reward
         info = {}
         if done:
             info['winner'] = winner
@@ -210,7 +227,7 @@ class UAVEnv:
             blue_center = np.mean(blue_alive_positions, axis=0)
             recon_alive = False
             recon_pos = None
-            if self.blue_recon_index is not None and self.blue_alive[self.blue_recon_index]:
+            if self.blue_recon_index is not None and self.blue_recon_index < len(self.blue_alive) and self.blue_alive[self.blue_recon_index]:
                 recon_alive = True
                 recon_pos = self.blue_positions[self.blue_recon_index]
             red_alive_indices = np.where(self.red_alive)[0]
@@ -287,35 +304,54 @@ class UAVEnv:
             return
     
     def _handle_combat(self):
-        """Handle weapon range combat: determine kills for Blue and Red, and update alive status and kill counts."""
-        # Determine any kills if opposing units are within weapon range
+        """Handle weapon range combat using probabilistic resolution:
+        For pairs within weapon_range, there is a distance-dependent chance that a kill occurs.
+        If a kill occurs, the winner is decided probabilistically biased toward Blue (configurable).
+        This prevents guaranteed mutual-destruction and lets the agent exploit blue advantage.
+        """
         blue_alive_indices = np.where(self.blue_alive)[0]
         red_alive_indices = np.where(self.red_alive)[0]
         if len(blue_alive_indices) == 0 or len(red_alive_indices) == 0:
             return
-        # Compute pairwise distances between all alive Blue and Red
+        # Positions of alive units
         blue_positions_alive = self.blue_positions[blue_alive_indices]
         red_positions_alive = self.red_positions[red_alive_indices]
-        # Use broadcasting to compute distance matrix
+        # Compute pairwise distances
         diff = blue_positions_alive[:, np.newaxis, :] - red_positions_alive[np.newaxis, :, :]
-        dist_matrix = np.linalg.norm(diff, axis=2)
-        # Find the minimum distance pair
-        min_dist = np.min(dist_matrix)
-        if min_dist < self.weapon_range:
-            # Identify indices of one pair at min distance
-            idx = np.argmin(dist_matrix)
-            b_idx = idx // dist_matrix.shape[1]
-            r_idx = idx % dist_matrix.shape[1]
-            blue_index = blue_alive_indices[b_idx]
-            red_index = red_alive_indices[r_idx]
-            # Kill that Red and Blue (one each)
-            self.red_alive[red_index] = False
-            self.blue_alive[blue_index] = False
-            # Increase kill counts accordingly
-            # Blue killed a Red
-            self.blue_kills += 1
-            # Red killed a Blue
-            self.red_kills += 1
+        dist_matrix = np.linalg.norm(diff, axis=2)  # shape (nb, nr)
+        # Flatten pair list and sort by distance ascending so close encounters resolve first
+        pairs = []
+        for ib in range(dist_matrix.shape[0]):
+            for ir in range(dist_matrix.shape[1]):
+                d = dist_matrix[ib, ir]
+                pairs.append((d, blue_alive_indices[ib], red_alive_indices[ir]))
+        pairs.sort(key=lambda x: x[0])
+        weapon_range = float(self.weapon_range)
+        # Parameters for probabilistic kill
+        max_kill_prob_scale = 0.9  # maximum total probability that a kill happens at zero distance
+        blue_favor = float(self.blue_advantage)  # e.g., 0.7 => 70% of kills favor blue when kill occurs
+        for d, b_idx, r_idx in pairs:
+            # Skip if either already dead due to earlier resolution
+            if not (self.blue_alive[b_idx] and self.red_alive[r_idx]):
+                continue
+            if d >= weapon_range:
+                continue
+            # compute base proximity factor (0..1)
+            proximity = max(0.0, 1.0 - (d / weapon_range))
+            # total probability that a kill occurs for this encounter
+            kill_total_prob = max_kill_prob_scale * proximity
+            if np.random.rand() < kill_total_prob:
+                # a kill occurs; decide who dies (favor blue)
+                if np.random.rand() < blue_favor:
+                    # Blue scores the kill (red dies)
+                    self.red_alive[r_idx] = False
+                    self.blue_kills += 1
+                else:
+                    # Red scores the kill (blue dies)
+                    self.blue_alive[b_idx] = False
+                    self.red_kills += 1
+            # else: no kill this pair this timestep
+        # done
     
     def _get_observation(self):
         """Compute the observation vector based on current state."""
@@ -344,24 +380,27 @@ class UAVEnv:
         interference_level = 0.0
         if self.scenario == 'S2':
             # if any jammer alive and Blue recon alive
-            if self.blue_recon_index is not None:
-                target_pos = self.blue_positions[self.blue_recon_index] if self.blue_recon_index is not None else np.mean(self.blue_positions[self.blue_alive], axis=0)
-            else:
+            if self.blue_recon_index is not None and self.blue_recon_index < len(self.blue_alive) and self.blue_alive[self.blue_recon_index]:
+                target_pos = self.blue_positions[self.blue_recon_index]
+            elif np.any(self.blue_alive):
                 target_pos = np.mean(self.blue_positions[self.blue_alive], axis=0)
+            else:
+                target_pos = None
             count_in_range = 0
             total_jammers = 0
-            for j_idx in self.red_jammer_indices:
-                if j_idx < len(self.red_alive) and self.red_alive[j_idx]:
-                    total_jammers += 1
-                    dist = np.linalg.norm(self.red_positions[j_idx] - target_pos)
-                    if dist < self.jammer_range:
-                        count_in_range += 1
+            if target_pos is not None:
+                for j_idx in self.red_jammer_indices:
+                    if j_idx < len(self.red_alive) and self.red_alive[j_idx]:
+                        total_jammers += 1
+                        dist = np.linalg.norm(self.red_positions[j_idx] - target_pos)
+                        if dist < self.jammer_range:
+                            count_in_range += 1
             if total_jammers > 0:
                 interference_level = count_in_range / total_jammers
         # bait_confidence (0~1)
         bait_confidence = 0.0
         if self.scenario == 'S4':
-            if self.red_decoy_index is not None and self.red_alive[self.red_decoy_index]:
+            if self.red_decoy_index is not None and self.red_decoy_index < len(self.red_alive) and self.red_alive[self.red_decoy_index]:
                 # distance between Blue center and decoy
                 if np.any(self.blue_alive):
                     blue_center = np.mean(self.blue_positions[self.blue_alive], axis=0)
@@ -372,8 +411,8 @@ class UAVEnv:
                     else:
                         bait_confidence = 0.0
             else:
-                # if decoy is already dead, perhaps Blue identified it (but too late)
-                bait_confidence = 1.0
+                # decoy dead -> set to 0 (no bait present)
+                bait_confidence = 0.0
         # goal_progress (0~1)
         goal_progress = self._compute_goal_progress()
         # Construct observation array
@@ -388,14 +427,14 @@ class UAVEnv:
         progress = 0.0
         if self.scenario == 'S1':
             # fraction of enemies eliminated
-            initial_red = len(self.red_alive)
+            initial_red = self.num_red_init
             eliminated = self.blue_kills  # number of Red killed by Blue
             progress = eliminated / initial_red
         elif self.scenario == 'S2':
             # combine fraction of enemies killed and recon survival
-            initial_red = len(self.red_alive)
+            initial_red = self.num_red_init
             kill_frac = self.blue_kills / initial_red
-            recon_alive = 1.0 if (self.blue_recon_index is not None and self.blue_recon_index < len(self.blue_alive) and self.blue_alive[self.blue_recon_index]) else 0.0
+            recon_alive = 1.0 if (self.blue_recon_index is not None and self.blue_recon_index < self.num_blue_init and self.blue_alive[self.blue_recon_index]) else 0.0
             progress = 0.5 * kill_frac + 0.5 * recon_alive
         elif self.scenario == 'S3':
             # 1 - (escaped_count/3), capped between 0 and 1
@@ -433,10 +472,16 @@ class UAVEnv:
         blue_alive_ratio = obs[3]  # own_alive_ratio at index 3 if relative_pos is 0-2
         red_alive_ratio = obs[4]   # enemy_alive_ratio at index 4
         survival_diff = blue_alive_ratio - red_alive_ratio
+        # Escape increment penalty (特别针对 S3)
+        current_escaped = np.sum(self.red_escaped)
+        escape_increment = int(current_escaped - self.prev_escaped_count)
+        # Update prev escaped count for next step
+        self.prev_escaped_count = current_escaped
+        escape_penalty_term = - self.escape_penalty * escape_increment if escape_increment > 0 else 0.0
         # Time penalty (for each step)
         time_penalty = 1.0
         # Total reward
-        reward = (self.alpha * kill_diff_increment) + (self.beta * progress_change) + (self.gamma * survival_diff) - (self.delta * time_penalty)
+        reward = (self.alpha * kill_diff_increment) + (self.beta * progress_change) + (self.gamma * survival_diff) + escape_penalty_term - (self.delta * time_penalty)
         return reward
     
     def _check_done(self):
